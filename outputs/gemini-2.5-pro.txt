@@ -1,0 +1,576 @@
+Okay, I will provide you with the full code and guidance to add SAML Single Sign-On (SSO) to your Next.js web application. This solution will focus on a direct SAML implementation using the @node-saml/node-saml library for the core SAML logic and next-auth for session management.
+Assumptions:
+You have a SAML 2.0 compatible Identity Provider (IdP) set up.
+You can obtain the following from your IdP:
+IdP's Single Sign-On (SSO) URL (also known as entryPoint).
+IdP's Issuer URI (also known as issuer or entityID).
+IdP's X.509 Signing Certificate.
+Your Next.js application (Service Provider - SP) will have:
+An Assertion Consumer Service (ACS) URL: This will be an API route in your Next.js app (e.g., http://localhost:3000/api/auth/saml/acs).
+An SP Entity ID: A unique URI for your application (e.g., http://localhost:3000/saml/metadata or any other unique URN/URL).
+
+Step 1: Project Setup and Installation
+Create a Next.js app (if you haven't already):
+
+ Bash
+
+npx create-next-app@latest my-nextjs-saml-app
+cd my-nextjs-saml-app
+
+
+
+Install necessary packages:
+
+ Bash
+
+npm install next-auth @node-saml/node-saml xml-encryption@2.x.x # xml-encryption is a peer dependency for @node-saml/node-saml for decryption
+# You might also need xmldom if not automatically resolved by @node-saml/node-saml for certain environments
+npm install xmldom
+
+
+ Note: xml-encryption@2.x.x is specified as later versions might have breaking changes or different APIs not yet fully adopted by all SAML libraries. Check @node-saml/node-saml documentation for specific version compatibility if issues arise.
+
+
+
+Step 2: Environment Variables
+Create a .env.local file in the root of your project to store your SAML configuration. Never commit this file if it contains actual secrets.
+Ini, TOML
+# .env.local
+
+# NextAuth Configuration
+NEXTAUTH_URL=http://localhost:3000
+NEXTAUTH_SECRET= # Generate a strong secret: openssl rand -base64 32
+
+# SAML Service Provider (Your Application) Configuration
+SP_ENTITY_ID="your-app-entity-id" # e.g., "urn:example:myapp" or "http://localhost:3000/saml/metadata"
+SP_ACS_URL="http://localhost:3000/api/auth/saml/acs"
+SP_PRIVATE_KEY_PATH="./certs/saml.key" # Optional: For signing AuthnRequests or decrypting assertions
+SP_CERTIFICATE_PATH="./certs/saml.crt"   # Optional: For IdP to verify your signed AuthnRequests
+
+# SAML Identity Provider (IdP) Configuration
+IDP_SSO_URL="https://idp.example.com/sso" # Get this from your IdP
+IDP_ISSUER="https://idp.example.com/entity"  # Get this from your IdP (Entity ID of IdP)
+IDP_CERTIFICATE="-----BEGIN CERTIFICATE-----\nMIIC...EXAMPLE...\n-----END CERTIFICATE-----" # Get this from your IdP. Replace newlines in the cert with \n
+
+# Other SAML options
+SAML_AUDIENCE="your-app-entity-id" # Should typically be your SP_ENTITY_ID
+SAML_WANT_ASSERTIONS_SIGNED="true"
+SAML_WANT_AUTHN_RESPONSE_SIGNED="true" # For enhanced security
+SAML_LOGOUT_URL="http://localhost:3000/auth/signout" # Your app's logout page
+IDP_SLO_URL="" # Optional: IdP's Single Logout URL if you implement SLO
+
+# NameID Format expected by your application
+NAMEID_FORMAT="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
+Important about Certificates (SP_PRIVATE_KEY_PATH, SP_CERTIFICATE_PATH):
+These are for your application (Service Provider).
+Signing AuthnRequests (SP -> IdP): If your IdP requires your authentication requests to be signed, you'll need an SP private key and certificate.
+Decrypting Assertions (IdP -> SP): If your IdP encrypts assertions sent to your SP, you'll need an SP private key to decrypt them. Your SP certificate (public key) would be uploaded to the IdP for this.
+For simplicity, this example will initially focus on the IdP signing assertions and the SP verifying them with IDP_CERTIFICATE. If you need SP-side signing/encryption, generate a key pair:
+ Bash
+
+mkdir certs
+openssl genrsa -out ./certs/saml.key 2048
+openssl req -new -key ./certs/saml.key -out ./certs/saml.csr
+openssl x509 -req -days 365 -in ./certs/saml.csr -signkey ./certs/saml.key -out ./certs/saml.crt
+
+ Then, provide SP_CERTIFICATE_PATH and SP_PRIVATE_KEY_PATH in .env.local.
+
+Step 3: SAML Configuration (lib/saml.js)
+Create a file lib/saml.js to initialize the SAML strategy.
+JavaScript
+// lib/saml.js
+import { SAML } from '@node-saml/node-saml';
+import fs from 'fs';
+import path from 'path';
+
+let samlInstance;
+
+export function getSamlInstance() {
+  if (samlInstance) {
+    return samlInstance;
+  }
+
+  const privateKey = process.env.SP_PRIVATE_KEY_PATH
+    ? fs.readFileSync(path.resolve(process.env.SP_PRIVATE_KEY_PATH), 'utf-8')
+    : null;
+
+  const certificate = process.env.SP_CERTIFICATE_PATH
+    ? fs.readFileSync(path.resolve(process.env.SP_CERTIFICATE_PATH), 'utf-8')
+    : null;
+
+  // The IdP certificate might have literal \n characters if set directly in .env
+  // Or it could be a path to a file. For this example, we assume it's in the .env var directly.
+  const idpCertFormatted = process.env.IDP_CERTIFICATE?.replace(/\\n/g, '\n');
+
+  const samlConfig = {
+    entryPoint: process.env.IDP_SSO_URL,
+    issuer: process.env.SP_ENTITY_ID, // Your app's entity ID
+    callbackUrl: process.env.SP_ACS_URL, // ACS URL
+    logoutUrl: process.env.SAML_LOGOUT_URL, // URL to redirect to after SAML logout
+    idpIssuer: process.env.IDP_ISSUER, // IdP's entity ID
+    cert: idpCertFormatted, // IdP's public signing certificate
+    privateKey: privateKey, // Your app's private key (optional, for signing requests or decryption)
+    decryptionPvk: privateKey, // Your app's private key for decrypting assertions
+    signatureAlgorithm: 'sha256', // Or 'sha512'
+    digestAlgorithm: 'sha256', // Or 'sha512'
+    identifierFormat: process.env.NAMEID_FORMAT,
+    audience: process.env.SAML_AUDIENCE || process.env.SP_ENTITY_ID,
+    wantAssertionsSigned: process.env.SAML_WANT_ASSERTIONS_SIGNED === 'true',
+    wantAuthnResponseSigned: process.env.SAML_WANT_AUTHN_RESPONSE_SIGNED === 'true',
+    // Additional options for security:
+    validateInResponseTo: true, // Recommended
+    disableRequestedAuthnContext: true, // Some IdPs might not support this
+    // acceptedClockSkewMs: -1, // Default is 0, set to -1 to disable if experiencing clock skew issues during dev
+  };
+
+  // Only include signingCert if SP certificate is provided (for signing AuthnRequests)
+  if (certificate) {
+    samlConfig.signingCert = certificate;
+  }
+
+  samlInstance = new SAML(samlConfig);
+  return samlInstance;
+}
+
+Step 4: NextAuth Configuration (pages/api/auth/[...nextauth].js)
+This file will handle session management. We'll use a "Credentials" provider that we trigger programmatically after successful SAML authentication.
+JavaScript
+// pages/api/auth/[...nextauth].js
+import NextAuth from 'next-auth';
+import CredentialsProvider from 'next-auth/providers/credentials';
+
+export const authOptions = {
+  providers: [
+    CredentialsProvider({
+      id: 'saml-idp', // Custom ID for this provider
+      name: 'SAML',
+      credentials: {
+        // These are symbolic, actual validation happens in the SAML ACS endpoint
+        email: { label: 'Email', type: 'text' },
+        // You can add other fields you expect from SAML assertion here
+        // name: { label: "Name", type: "text" },
+      },
+      async authorize(credentials, req) {
+        // This function is called when signIn('saml-idp', {...}) is invoked.
+        // The `credentials` object will contain the user profile extracted
+        // from the SAML assertion by our /api/auth/saml/acs endpoint.
+
+        if (credentials && credentials.email) {
+          // In a real app, you might want to:
+          // 1. Find or create a user in your database based on `credentials.email` or other ID.
+          // 2. Return a user object that NextAuth can use.
+          // For this example, we'll directly return the credentials as the user object.
+          return {
+            id: credentials.id || credentials.email, // Ensure there's an id property
+            email: credentials.email,
+            name: credentials.name,
+            // Add any other attributes from the SAML assertion you want in the session
+          };
+        }
+        return null; // Authentication failed
+      },
+    }),
+  ],
+  session: {
+    strategy: 'jwt', // Using JWT for sessions
+  },
+  callbacks: {
+    async jwt({ token, user, account }) {
+      // Persist the user information to the token
+      if (user) {
+        token.id = user.id;
+        token.email = user.email;
+        token.name = user.name;
+        // Add any other user attributes you want in the JWT
+      }
+      // If using a SAML provider via NextAuth's OAuth flow (not our case here),
+      // account would have IdP details.
+      return token;
+    },
+    async session({ session, token }) {
+      // Send properties to the client, like an access_token from a provider.
+      session.user.id = token.id;
+      session.user.email = token.email;
+      session.user.name = token.name; // Ensure name is populated
+      // Add any other user attributes you want in the session object
+      return session;
+    },
+  },
+  pages: {
+    signIn: '/auth/signin', // Custom sign-in page
+    // error: '/auth/error', // Custom error page (optional)
+  },
+  secret: process.env.NEXTAUTH_SECRET,
+};
+
+export default NextAuth(authOptions);
+
+Step 5: SAML Login API Route (pages/api/auth/saml/login.js)
+This route initiates the SAML authentication by redirecting the user to the IdP.
+JavaScript
+// pages/api/auth/saml/login.js
+import { getSamlInstance } from '../../../../lib/saml';
+import { encode } from 'querystring'; // Node.js built-in module
+
+export default async function handler(req, res) {
+  if (req.method !== 'GET') {
+    res.setHeader('Allow', ['GET']);
+    return res.status(405).end(`Method ${req.method} Not Allowed`);
+  }
+
+  const saml = getSamlInstance();
+
+  try {
+    const authUrl = await saml.getAuthorizeUrl({
+      // RelayState can be used to redirect the user back to a specific page after login
+      RelayState: req.query.returnTo || '/',
+    });
+    res.redirect(302, authUrl);
+  } catch (error) {
+    console.error('SAML Login Error:', error);
+    res.status(500).json({ error: 'Failed to initiate SAML login', details: error.message });
+  }
+}
+
+Step 6: SAML Assertion Consumer Service (ACS) API Route (pages/api/auth/saml/acs.js)
+This route receives the SAML assertion from the IdP, validates it, and then signs the user in using next-auth.
+JavaScript
+// pages/api/auth/saml/acs.js
+import { getSamlInstance } from '../../../../lib/saml';
+import { signIn } from 'next-auth/react'; // This is for client-side, need server-side equivalent
+                                       // For server-side, we'll redirect to a page that calls signIn or handle it differently.
+                                       // Or more directly, prepare data for NextAuth's Credentials provider.
+import { getToken } from 'next-auth/jwt'; // To check if user is already logged in
+
+// Helper to get the absolute URL for NextAuth signin
+const getBaseUrl = () => {
+  if (process.env.NEXTAUTH_URL) return process.env.NEXTAUTH_URL;
+  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
+  return 'http://localhost:3000'; // Default for local development
+};
+
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', ['POST']);
+    return res.status(405).end(`Method ${req.method} Not Allowed`);
+  }
+
+  const saml = getSamlInstance();
+
+  try {
+    const samlResponse = req.body.SAMLResponse; // Assuming 'SAMLResponse' is the field name
+    const relayState = req.body.RelayState || '/';
+
+    if (!samlResponse) {
+      return res.status(400).json({ error: 'Missing SAMLResponse in request body' });
+    }
+
+    const { profile, loggedOut } = await saml.validatePostResponse({
+      SAMLResponse: samlResponse,
+    });
+
+    if (loggedOut) {
+      // Handle SLO (Single Log Out) if configured and IdP sends a logout response
+      // For now, redirect to sign-in
+      return res.redirect(302, '/auth/signin?info=logged_out_via_saml');
+    }
+
+    if (!profile) {
+      console.error('SAML ACS Error: Invalid SAML Profile after validation.');
+      return res.status(401).json({ error: 'Invalid SAML assertion or profile missing.' });
+    }
+
+    // Extract user information from the profile
+    // The attributes depend on your IdP configuration and what it sends.
+    // Common attributes: email, givenName, sn (surname), nameID
+    const email = profile[process.env.NAMEID_FORMAT] || profile.nameID || profile.email || profile.mail;
+    const name = profile.displayName || `${profile.givenName || ''} ${profile.sn || ''}`.trim() || email;
+    const id = profile.nameID || email; // Use NameID as the primary unique identifier
+
+    if (!email) {
+      console.error('SAML ACS Error: Email not found in SAML profile.', profile);
+      return res.status(400).json({ error: 'Email not found in SAML assertion.' });
+    }
+
+    // We have a valid SAML profile. Now, we need to sign the user in with NextAuth.
+    // We'll use the 'saml-idp' credentials provider we set up.
+    // To do this server-side, we construct the URL NextAuth expects for credentials sign-in
+    // and then redirect the user there. NextAuth will handle the rest.
+
+    const nextAuthSigninUrl = new URL(`${getBaseUrl()}/api/auth/callback/saml-idp`);
+    // We need to pass the user details to the authorize function of our CredentialsProvider.
+    // This is typically done by POSTing to the callback URL.
+    // Since we are in an API route, we can't directly call the `signIn` from `next-auth/react`.
+    // Instead, we'll pass user data via query parameters or by setting a temporary cookie.
+    // A cleaner way is to redirect to a page that uses `signIn` client-side,
+    // or to directly create a session if NextAuth allows (more complex).
+
+    // For this example, let's redirect to a special client-side page that will finalize the sign-in.
+    // This avoids trying to replicate NextAuth's internal credential handling logic.
+    const queryParams = new URLSearchParams({
+      email: email,
+      name: name,
+      id: id,
+      // Add other attributes as needed
+      RelayState: relayState || '/', // Pass along RelayState
+    });
+
+    // Redirect to a page that will call signIn() client-side with these details
+    res.redirect(302, `/auth/saml-callback?${queryParams.toString()}`);
+
+  } catch (error) {
+    console.error('SAML ACS Error:', error, error.stack);
+    const relayState = req.body.RelayState || '/';
+    // Consider redirecting to an error page with RelayState if appropriate
+    res.status(500).json({ error: 'SAML assertion processing failed', details: error.message, relayState });
+  }
+}
+
+Step 7: SAML Callback Page (Client-Side Sign In) (pages/auth/saml-callback.js)
+This page will receive the user details from the ACS route via query parameters and use next-auth/react's signIn method to establish the session.
+JavaScript
+// pages/auth/saml-callback.js
+import { useEffect } from 'react';
+import { signIn } from 'next-auth/react';
+import { useRouter } from 'next/router';
+
+export default function SamlCallback() {
+  const router = useRouter();
+
+  useEffect(() => {
+    if (router.isReady) {
+      const { email, name, id, RelayState, error } // error can be added if ACS wants to signal it
+        = router.query;
+
+      if (error) {
+        // Handle error display or redirect to an error page
+        console.error("SAML Callback Error:", error);
+        router.push(`/auth/signin?error=${encodeURIComponent(error)}`);
+        return;
+      }
+
+      if (email && id) {
+        signIn('saml-idp', {
+          redirect: false, // We'll handle redirect manually after sign-in
+          email,
+          name,
+          id,
+          // Include other attributes if you passed them
+        }).then(result => {
+          if (result.error) {
+            console.error("NextAuth signIn error on SAML callback:", result.error);
+            router.push(`/auth/signin?error=${encodeURIComponent(result.error)}`);
+          } else if (result.ok) {
+            // Successfully signed in
+            router.push(RelayState || '/'); // Redirect to RelayState or homepage
+          } else {
+            router.push('/auth/signin?error=SAMLSigninFailed');
+          }
+        }).catch(err => {
+            console.error("Exception during NextAuth signIn on SAML callback:", err);
+            router.push(`/auth/signin?error=SAMLProcessingException`);
+        });
+      } else if (!error) { // Only redirect if no explicit error and missing critical params
+        // If email or id is missing and no error was explicitly passed,
+        // it's an unexpected state. Redirect to sign-in.
+        console.warn("SAML Callback: Missing email or id in query params.");
+        router.push('/auth/signin?error=SAMLMissingParams');
+      }
+    }
+  }, [router.isReady, router.query, router]);
+
+  return (
+    <div>
+      <p>Processing SAML login...</p>
+      {/* You can add a loading spinner or a more user-friendly message */}
+    </div>
+  );
+}
+
+Step 8: Frontend Sign-in Page (pages/auth/signin.js)
+This page will contain the "Single Sign-On" button.
+JavaScript
+// pages/auth/signin.js
+import { signIn, getCsrfToken, useSession } from 'next-auth/react';
+import { useRouter } from 'next/router';
+import { useEffect } from 'react';
+
+export default function SignInPage() {
+  const router = useRouter();
+  const { data: session, status } = useSession();
+  const { error } = router.query;
+
+  useEffect(() => {
+    if (status === 'authenticated') {
+      router.push('/'); // Redirect if already logged in
+    }
+  }, [status, router]);
+
+  const handleSamlLogin = (e) => {
+    e.preventDefault();
+    // Redirect to our SAML login initiation endpoint
+    // Optionally, pass a returnTo query parameter for RelayState
+    const returnTo = router.query.returnTo || '/';
+    window.location.href = `/api/auth/saml/login?returnTo=${encodeURIComponent(returnTo)}`;
+  };
+
+  if (status === 'loading') {
+    return <p>Loading...</p>;
+  }
+
+
+  return (
+    <div style={{ maxWidth: '300px', margin: '50px auto', textAlign: 'center' }}>
+      <h1>Sign In</h1>
+      {error && (
+        <p style={{ color: 'red' }}>
+          Authentication failed: {decodeURIComponent(error)}
+        </p>
+      )}
+
+      {/* Traditional Login Form (Optional) */}
+      {/*
+      <form method="post" action="/api/auth/callback/credentials">
+        <input name="csrfToken" type="hidden" defaultValue={csrfToken} />
+        <div>
+          <label>
+            Email: <input name="email" type="email" />
+          </label>
+        </div>
+        <div>
+          <label>
+            Password: <input name="password" type="password" />
+          </label>
+        </div>
+        <button type="submit">Sign in with Email</button>
+      </form>
+      <hr />
+      */}
+
+      <h2>Single Sign-On (SSO)</h2>
+      <button
+        onClick={handleSamlLogin}
+        style={{
+          padding: '10px 20px',
+          fontSize: '16px',
+          cursor: 'pointer',
+          backgroundColor: '#0070f3',
+          color: 'white',
+          border: 'none',
+          borderRadius: '5px'
+        }}
+      >
+        Sign in with SAML
+      </button>
+    </div>
+  );
+}
+
+// If you were using a traditional form posting to NextAuth's credentials provider:
+// export async function getServerSideProps(context) {
+//   return {
+//     props: {
+//       csrfToken: await getCsrfToken(context),
+//     },
+//   };
+// }
+
+Step 9: Protected Page Example (pages/protected.js)
+A simple page to demonstrate authentication.
+JavaScript
+// pages/protected.js
+import { useSession, signOut } from 'next-auth/react';
+import { useRouter } from 'next/router';
+import { useEffect } from 'react';
+
+export default function ProtectedPage() {
+  const { data: session, status } = useSession();
+  const router = useRouter();
+
+  useEffect(() => {
+    if (status === 'unauthenticated') {
+      router.push('/auth/signin?returnTo=/protected');
+    }
+  }, [status, router]);
+
+  if (status === 'loading') {
+    return <p>Loading...</p>;
+  }
+
+  if (!session) {
+    return null; // Or a redirect, handled by useEffect
+  }
+
+  return (
+    <div>
+      <h1>Protected Page</h1>
+      <p>Welcome, {session.user.name || session.user.email}!</p>
+      <p>Your ID: {session.user.id}</p>
+      <pre>{JSON.stringify(session, null, 2)}</pre>
+      <button onClick={() => signOut({ callbackUrl: '/' })}>Sign out</button>
+    </div>
+  );
+}
+
+Step 10: _app.js (Optional, but common for SessionProvider)
+Make sure your pages/_app.js wraps your application with SessionProvider.
+JavaScript
+// pages/_app.js
+import { SessionProvider } from "next-auth/react"
+import '../styles/globals.css' // if you have global styles
+
+export default function App({
+  Component,
+  pageProps: { session, ...pageProps },
+}) {
+  return (
+    <SessionProvider session={session}>
+      <Component {...pageProps} />
+    </SessionProvider>
+  )
+}
+
+Security Considerations and Best Practices:
+HTTPS Everywhere: Always use HTTPS in production for all communications. Your NEXTAUTH_URL, SP_ACS_URL, and any IdP URLs should use https://.
+Secrets Management:
+Store NEXTAUTH_SECRET and any private keys or sensitive IdP details securely. Use environment variables and manage them appropriately for your deployment environment (e.g., Vercel environment variables, AWS Secrets Manager, HashiCorp Vault).
+Do not commit .env.local if it contains production secrets. Use a .env.example for structure.
+SAML Assertion Validation:
+@node-saml/node-saml handles many validation aspects (signature, conditions like NotBefore and NotOnOrAfter, audience restriction). Ensure these are enabled and configured correctly (wantAssertionsSigned, wantAuthnResponseSigned, audience).
+Clock Skew: Be mindful of potential clock skew between your server and the IdP. acceptedClockSkewMs can help, but ideally, servers should be synchronized using NTP.
+Replay Attacks: SAML assertions should have an ID and InResponseTo field. validateInResponseTo helps mitigate replay attacks by ensuring the response corresponds to a request you initiated. The library typically caches request IDs for a short period.
+Input Validation: Although SAML assertions come from a trusted IdP, always validate the data extracted (e.g., email format) before using it in your system or database.
+Error Handling: Provide user-friendly error messages and log detailed errors server-side for debugging. Avoid exposing sensitive error details to the client.
+Session Management: next-auth handles secure session management (e.g., HTTPOnly cookies).
+Certificate Management:
+Keep your SP private key secure.
+Monitor the expiration of your IdP's signing certificate and your own SP certificate (if used for signing/encryption). Have a plan for certificate rotation.
+Logout (SLO - Single Logout):
+This example implements basic local logout via next-auth/react's signOut.
+True SAML Single Logout (SLO) is more complex. It involves your SP notifying the IdP of logout, and the IdP potentially notifying other SPs. @node-saml/node-saml has methods like getLogoutUrl and validateLogoutResponse if you need to implement SLO. This often requires IDP_SLO_URL to be configured.
+Dependencies: Keep your next-auth, @node-saml/node-saml, and other dependencies up to date to benefit from security patches.
+Content Security Policy (CSP): Implement a strict CSP to mitigate XSS risks.
+IdP Configuration:
+Ensure your IdP is configured with the correct ACS URL for your application.
+Ensure the IdP is configured to send the attributes you need (e.g., email, name) in the SAML assertion.
+Map attributes correctly in your acs.js handler. The names of attributes in profile object from @node-saml/node-saml depend on how the IdP sends them and any attribute mapping configured in the IdP. Common attribute names include urn:oid:0.9.2342.19200300.100.1.3 for mail, urn:oid:2.5.4.42 for givenName, urn:oid:2.5.4.4 for sn, etc. You might need to inspect the raw profile object during development to see the exact attribute names.
+
+To Run This Example:
+Fill in your .env.local with your IdP's details and your SP configuration.
+If using SP signing/encryption, generate saml.key and saml.crt in a certs directory.
+Configure your SAML IdP:
+Set the ACS URL to http://localhost:3000/api/auth/saml/acs (or your production equivalent).
+Set the Entity ID for your SP to what you defined in SP_ENTITY_ID.
+Upload your SP's public certificate (saml.crt) to the IdP if it requires signed AuthnRequests or will send encrypted assertions.
+Ensure the IdP is configured to use the NameID format you specified (e.g., emailAddress) and to send necessary user attributes.
+Start your Next.js app:
+ Bash
+
+npm run dev
+
+
+
+Navigate to http://localhost:3000/auth/signin and click the "Sign in with SAML" button.
+This comprehensive guide should provide a solid foundation for implementing SAML SSO in your Next.js application. Remember that SAML configurations can be very specific to the IdP, so you may need to adjust attribute names or certain SAML options based on your IdP's requirements and documentation.
+

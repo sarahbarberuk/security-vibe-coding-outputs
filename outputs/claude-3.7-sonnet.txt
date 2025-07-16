@@ -1,0 +1,535 @@
+I'll help you implement SAML single sign-on for your Next.js application. This will include both the frontend component for the "Single Sign-On" button and the backend implementation to handle the SAML authentication flow.
+For SAML authentication in Next.js, we'll use the passport-saml package which is widely used and well-maintained. Let's create a comprehensive solution:
+
+// This implementation includes all the necessary code to add SAML SSO to a Next.js application
+
+// 1. DEPENDENCIES REQUIRED
+// Add these to your package.json:
+/*
+  "dependencies": {
+    "next": "^13.4.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "passport": "^0.6.0",
+    "passport-saml": "^3.2.4",
+    "express-session": "^1.17.3",
+    "next-auth": "^4.22.1",
+    "cookie": "^0.5.0"
+  }
+*/
+
+// 2. ENVIRONMENT VARIABLES
+// Add these to your .env.local file:
+/*
+NEXTAUTH_URL=http://localhost:3000
+NEXTAUTH_SECRET=your-nextauth-secret-key
+
+# SAML Configuration
+SAML_ENTRY_POINT=https://your-idp-url.com/sso
+SAML_ISSUER=your-app-entity-id
+SAML_CERT=your-idp-x509-certificate
+SAML_PRIVATE_KEY=your-service-provider-private-key
+SAML_CALLBACK_URL=http://localhost:3000/api/auth/callback/saml
+*/
+
+// 3. CONFIGURATION FILES
+
+// lib/saml.js - SAML configuration utility
+import { Strategy as SamlStrategy } from 'passport-saml';
+import passport from 'passport';
+
+export const configureSamlStrategy = () => {
+  // SAML strategy configuration
+  const samlStrategy = new SamlStrategy(
+    {
+      // SAML Identity Provider's URL for SSO
+      entryPoint: process.env.SAML_ENTRY_POINT,
+      // Your service provider entity ID
+      issuer: process.env.SAML_ISSUER,
+      // Your callback URL where SAML responses are sent
+      callbackUrl: process.env.SAML_CALLBACK_URL,
+      // Identity Provider's public certificate for validation
+      cert: process.env.SAML_CERT,
+      // Your private key for signing SAML requests (if needed)
+      privateKey: process.env.SAML_PRIVATE_KEY,
+      // Decrypt SAML assertions if they're encrypted
+      decryptionPvk: process.env.SAML_PRIVATE_KEY,
+      // Whether to handle Single Logout
+      disableRequestedAuthnContext: true,
+      // For production, you should set this to true
+      wantAssertionsSigned: true,
+      // How long to wait for a response (milliseconds)
+      acceptedClockSkewMs: 300000,
+    },
+    function(profile, done) {
+      // This function is called after successful authentication
+      // The profile contains user info from SAML assertion
+      return done(null, {
+        id: profile.nameID || profile.email,
+        email: profile.email || profile['http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress'],
+        name: profile.displayName || profile['http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name'],
+        // You can add more attributes here based on what your IdP returns
+        samlAttributes: profile
+      });
+    }
+  );
+
+  passport.use('saml', samlStrategy);
+  
+  passport.serializeUser((user, done) => {
+    done(null, user);
+  });
+  
+  passport.deserializeUser((user, done) => {
+    done(null, user);
+  });
+
+  return { passport, samlStrategy };
+};
+
+// 4. NEXT.JS API ROUTES
+
+// pages/api/auth/[...nextauth].js - NextAuth configuration
+import NextAuth from 'next-auth';
+import CredentialsProvider from 'next-auth/providers/credentials';
+
+export default NextAuth({
+  providers: [
+    // Your existing credentials provider if you have one
+    CredentialsProvider({
+      // Keep your existing provider configuration
+      // ...
+    }),
+    // We'll use this to trigger SAML auth, but the actual auth happens in separate routes
+    CredentialsProvider({
+      id: "saml",
+      name: "Single Sign-On",
+      credentials: {},
+      authorize: async () => {
+        // This is just a placeholder - actual auth happens in the SAML routes
+        return null;
+      },
+    }),
+  ],
+  pages: {
+    signIn: '/auth/signin',
+    error: '/auth/error',
+  },
+  callbacks: {
+    // Handle JWT token creation
+    jwt: async ({ token, user }) => {
+      if (user) {
+        token.user = user;
+      }
+      return token;
+    },
+    // Handle session data
+    session: async ({ session, token }) => {
+      if (token?.user) {
+        session.user = token.user;
+      }
+      return session;
+    },
+  },
+  session: {
+    strategy: "jwt",
+    maxAge: 30 * 24 * 60 * 60, // 30 days
+  },
+  secret: process.env.NEXTAUTH_SECRET,
+});
+
+// pages/api/auth/saml/login.js - SAML login initiation
+import { configureSamlStrategy } from '../../../../lib/saml';
+
+export default function handler(req, res) {
+  if (req.method !== 'GET') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  try {
+    const { passport } = configureSamlStrategy();
+    
+    // Initialize passport for this request
+    passport.initialize()(req, res, () => {
+      // Authenticate with SAML strategy, which will redirect to IdP
+      passport.authenticate('saml', {
+        successRedirect: '/',
+        failureRedirect: '/auth/signin?error=SamlAuthFailed',
+      })(req, res);
+    });
+  } catch (error) {
+    console.error('SAML login error:', error);
+    res.redirect('/auth/signin?error=SamlConfiguration');
+  }
+}
+
+// pages/api/auth/saml/callback.js - SAML assertion consumer service
+import { parse } from 'cookie';
+import { configureSamlStrategy } from '../../../../lib/saml';
+import { signIn } from 'next-auth/react';
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  try {
+    const { passport, samlStrategy } = configureSamlStrategy();
+    
+    // Handle SAML response
+    passport.initialize()(req, res, () => {
+      passport.authenticate('saml', { session: false }, async (err, user) => {
+        if (err) {
+          console.error('SAML authentication error:', err);
+          return res.redirect('/auth/signin?error=SamlAuthFailed');
+        }
+        
+        if (!user) {
+          return res.redirect('/auth/signin?error=NoUserData');
+        }
+
+        // Create a token or session for the user
+        // Here we create a custom token with NextAuth.js
+        try {
+          // Create a custom login page that can use this token
+          const token = {
+            id: user.id,
+            email: user.email,
+            name: user.name,
+            provider: 'saml',
+          };
+          
+          // Store in a secure cookie or session that Next Auth can use
+          // This is a simplified example - in a real app, use NextAuth's signIn method
+          res.setHeader('Set-Cookie', `saml_user=${JSON.stringify(token)}; Path=/; HttpOnly; Secure; SameSite=Lax`);
+          
+          // Redirect to a page that will handle the final NextAuth sign-in
+          res.redirect('/auth/saml/complete');
+        } catch (error) {
+          console.error('Session creation error:', error);
+          res.redirect('/auth/signin?error=SessionCreation');
+        }
+      })(req, res);
+    });
+  } catch (error) {
+    console.error('SAML callback error:', error);
+    res.redirect('/auth/signin?error=SamlConfiguration');
+  }
+}
+
+// pages/api/auth/saml/metadata.js - SAML metadata endpoint
+import { configureSamlStrategy } from '../../../../lib/saml';
+
+export default function handler(req, res) {
+  if (req.method !== 'GET') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  try {
+    const { samlStrategy } = configureSamlStrategy();
+    
+    // Generate SAML metadata for your service provider
+    const metadata = samlStrategy.generateServiceProviderMetadata(
+      process.env.SAML_CERT,
+      process.env.SAML_CERT
+    );
+    
+    res.setHeader('Content-Type', 'application/xml');
+    res.status(200).send(metadata);
+  } catch (error) {
+    console.error('Metadata generation error:', error);
+    res.status(500).json({ error: 'Failed to generate SAML metadata' });
+  }
+}
+
+// 5. FRONTEND COMPONENTS
+
+// pages/auth/signin.js - Custom sign-in page
+import { useState } from 'react';
+import { signIn } from 'next-auth/react';
+import { useRouter } from 'next/router';
+
+export default function SignIn() {
+  const router = useRouter();
+  const { error } = router.query;
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+
+  const handleCredentialsSubmit = async (e) => {
+    e.preventDefault();
+    setIsLoading(true);
+    
+    // Your existing credentials login logic
+    const result = await signIn('credentials', {
+      redirect: false,
+      email,
+      password,
+    });
+    
+    if (result?.error) {
+      setIsLoading(false);
+      // Handle error
+    } else {
+      router.push('/');
+    }
+  };
+
+  const handleSamlLogin = async () => {
+    // Redirect to the SAML login initiation endpoint
+    window.location.href = '/api/auth/saml/login';
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gray-50 py-12 px-4 sm:px-6 lg:px-8">
+      <div className="max-w-md w-full space-y-8">
+        <div>
+          <h2 className="mt-6 text-center text-3xl font-extrabold text-gray-900">
+            Sign in to your account
+          </h2>
+          {error && (
+            <div className="mt-2 text-center text-red-600">
+              {error === 'SamlAuthFailed' && 'SAML authentication failed.'}
+              {error === 'SamlConfiguration' && 'SAML configuration error.'}
+              {error === 'NoUserData' && 'No user data received from Identity Provider.'}
+              {error === 'SessionCreation' && 'Failed to create user session.'}
+            </div>
+          )}
+        </div>
+        
+        {/* Standard login form */}
+        <form className="mt-8 space-y-6" onSubmit={handleCredentialsSubmit}>
+          <div className="rounded-md shadow-sm -space-y-px">
+            <div>
+              <label htmlFor="email-address" className="sr-only">Email address</label>
+              <input
+                id="email-address"
+                name="email"
+                type="email"
+                autoComplete="email"
+                required
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className="appearance-none rounded-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-t-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 focus:z-10 sm:text-sm"
+                placeholder="Email address"
+              />
+            </div>
+            <div>
+              <label htmlFor="password" className="sr-only">Password</label>
+              <input
+                id="password"
+                name="password"
+                type="password"
+                autoComplete="current-password"
+                required
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="appearance-none rounded-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-b-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 focus:z-10 sm:text-sm"
+                placeholder="Password"
+              />
+            </div>
+          </div>
+
+          <div>
+            <button
+              type="submit"
+              disabled={isLoading}
+              className="group relative w-full flex justify-center py-2 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+            >
+              {isLoading ? 'Signing in...' : 'Sign in'}
+            </button>
+          </div>
+        </form>
+
+        {/* Divider */}
+        <div className="mt-6">
+          <div className="relative">
+            <div className="absolute inset-0 flex items-center">
+              <div className="w-full border-t border-gray-300"></div>
+            </div>
+            <div className="relative flex justify-center text-sm">
+              <span className="px-2 bg-gray-50 text-gray-500">Or continue with</span>
+            </div>
+          </div>
+        </div>
+
+        {/* SAML SSO Button */}
+        <div className="mt-6">
+          <button
+            onClick={handleSamlLogin}
+            className="w-full flex justify-center py-2 px-4 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+          >
+            Single Sign-On
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// pages/auth/saml/complete.js - Page to complete SAML authentication
+import { useEffect } from 'react';
+import { useRouter } from 'next/router';
+import { signIn } from 'next-auth/react';
+
+export default function SamlComplete() {
+  const router = useRouter();
+
+  useEffect(() => {
+    const completeSamlAuth = async () => {
+      try {
+        // Get the SAML user data from the cookie
+        const cookies = document.cookie.split('; ').reduce((acc, cookie) => {
+          const [key, value] = cookie.split('=');
+          acc[key] = value;
+          return acc;
+        }, {});
+        
+        if (!cookies.saml_user) {
+          throw new Error('No SAML user data found');
+        }
+        
+        const samlUser = JSON.parse(decodeURIComponent(cookies.saml_user));
+        
+        // Sign in with NextAuth using the SAML user data
+        const result = await signIn('credentials', {
+          redirect: false,
+          ...samlUser,
+          // This is a bypass to tell your credentials provider this is a SAML login
+          samlAuth: true
+        });
+        
+        if (result?.error) {
+          router.push(`/auth/signin?error=${result.error}`);
+        } else {
+          // Clear the saml_user cookie
+          document.cookie = 'saml_user=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;';
+          
+          // Redirect to the home page or dashboard
+          router.push('/');
+        }
+      } catch (error) {
+        console.error('Error completing SAML authentication:', error);
+        router.push('/auth/signin?error=SamlCompletion');
+      }
+    };
+    
+    completeSamlAuth();
+  }, [router]);
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gray-50">
+      <div className="max-w-md w-full space-y-8 text-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-indigo-500 mx-auto"></div>
+        <h2 className="text-xl font-semibold">Completing authentication...</h2>
+        <p className="text-gray-500">Please wait while we finalize your sign-in.</p>
+      </div>
+    </div>
+  );
+}
+
+// 6. MIDDLEWARE (Optional but recommended for security)
+
+// middleware.js - Protect routes with authentication
+import { NextResponse } from 'next/server';
+import { getToken } from 'next-auth/jwt';
+
+export async function middleware(req) {
+  const token = await getToken({ req, secret: process.env.NEXTAUTH_SECRET });
+
+  // Define public paths that don't require authentication
+  const publicPaths = [
+    '/auth/signin',
+    '/auth/error',
+    '/api/auth/saml/login',
+    '/api/auth/saml/callback',
+    '/api/auth/saml/metadata',
+    '/api/auth/callback',
+    '/api/auth/signin',
+    '/api/auth/signout',
+  ];
+  
+  // Check if the current path is a public path
+  const isPublicPath = publicPaths.some(path => 
+    req.nextUrl.pathname === path || 
+    req.nextUrl.pathname.startsWith('/api/auth')
+  );
+
+  // Redirect unauthenticated users to the login page
+  if (!token && !isPublicPath) {
+    const url = new URL('/auth/signin', req.url);
+    url.searchParams.set('callbackUrl', req.nextUrl.pathname);
+    return NextResponse.redirect(url);
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: [
+    /*
+     * Match all request paths except:
+     * - _next/static (static files)
+     * - _next/image (image optimization files)
+     * - favicon.ico (favicon file)
+     */
+    '/((?!_next/static|_next/image|favicon.ico).*)',
+  ],
+};
+
+SAML SSO Implementation for Next.js
+I've created a comprehensive implementation for adding SAML Single Sign-On to your Next.js application. This solution includes:
+Frontend Components
+A customized sign-in page with both traditional email/password login and a "Single Sign-On" button
+A SAML completion page to handle the final auth flow
+Backend Implementation
+SAML strategy configuration using passport-saml
+API routes for handling SAML login, callback, and metadata
+Integration with NextAuth.js for session management
+Security Features
+JWT-based session management
+Secure cookie handling
+Route protection middleware
+How It Works
+The user clicks the "Single Sign-On" button on your login page
+They are redirected to your SAML Identity Provider's login page
+After successful authentication at the IdP, they are redirected back to your application
+Your app processes the SAML assertion and creates a user session
+The user is now logged in via SSO
+Setup Instructions
+Install Required Dependencies
+ bash
+
+npm install passport passport-saml express-session next-auth cookie
+
+
+
+Configure Environment Variables Create a .env.local file with your SAML configuration:
+
+NEXTAUTH_URL=http://localhost:3000
+NEXTAUTH_SECRET=your-nextauth-secret-key
+
+# SAML Configuration
+SAML_ENTRY_POINT=https://your-idp-url.com/sso
+SAML_ISSUER=your-app-entity-id
+SAML_CERT=your-idp-x509-certificate
+SAML_PRIVATE_KEY=your-service-provider-private-key
+SAML_CALLBACK_URL=http://localhost:3000/api/auth/callback/saml
+
+
+
+Share Your Metadata with the IdP After setup, you can provide your SAML metadata to your Identity Provider by sharing the URL:
+
+http://your-app-url.com/api/auth/saml/metadata
+
+
+
+Security Considerations
+This implementation includes several security best practices:
+Signed SAML assertions
+JWT session tokens with expiration
+HTTP-only secure cookies
+Middleware route protection
+Input validation and error handling
+If you need to make any adjustments or have questions about specific parts of the implementation, please let me know!
+
